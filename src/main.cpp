@@ -10,7 +10,24 @@ int lastRequestMs = -1;
 
 int TERMINAL_ID = 99;
 const char* TERMINAL_PASSWORD = "password";
-String BASE_URI = "http://10.1.0.100:2321/v1";
+String BASE_URI = "http://10.1.0.100:2321/api/v1";
+
+const char* PUMP_STATES[] = {
+  "PumpError",
+  "NotResponding",
+  "NotInstalled",
+  "Busy",
+  "Locked",
+  "NotAllowed",
+  "Calling",
+  "Authorising",
+  "AuthFailed",
+  "Delivering",
+  "DelFinished",
+  "DelPaused",
+  "DelStopped",
+  "ManualPump",
+};
 
 char accessToken[64] = "";
 
@@ -83,47 +100,86 @@ void setup() {
   display.display();
 }
 
+void writeErrorToDisplay(String message, String details = "") {
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.println(F("======= ERROR ======="));
+  display.println(message);
+  if (details.length() != 0)
+    display.println(details);
+  drawStatusBar();
+  display.display();
+}
+
+std::optional<JsonArray> handleResponse(HTTPClient& http, JsonDocument& doc) {
+  DeserializationError error = deserializeJson(doc, http.getStream());
+  if (error) {
+    writeErrorToDisplay(String("deserializeJson() ") + error.f_str());
+    return {};
+  }
+
+  if (!doc["result"].is<int>()) {
+    writeErrorToDisplay(F("no 'result' in response"));
+    return {};
+  }
+
+  if (doc["result"] != 0) {
+    writeErrorToDisplay(doc["error"], doc["errorMessage"]);
+    if (doc["result"] == 7) // not logged on
+      accessToken[0] = '\0';
+    return {};
+  }
+  
+  if (!doc["data"].is<JsonArray>()) {
+    writeErrorToDisplay(F("no 'data' in response"));
+    return {};
+  }
+
+  return doc["data"];
+}
+
 bool updateAccessToken() {
   // update display
   display.clearDisplay();
+  display.setCursor(0, 0);
   display.print(F("requesting token..."));
   drawStatusBar();
   display.display();
+  delay(500);
 
   // get a new token
   WiFiClient client;
   HTTPClient http;
-  if (http.begin(client, BASE_URI + "/login")) {
-    http.useHTTP10(true); // https://arduinojson.org/v7/how-to/use-arduinojson-with-httpclient/
-    char output[256];
-    {
-      JsonDocument doc;
-      doc["terminalID"] = TERMINAL_ID;
-      doc["password"] = TERMINAL_PASSWORD;
-      doc["active"] = 0;
-      serializeJson(doc, output);
-    }
-    
-    int httpCode = http.POST(output);
-    if (httpCode == 0) {
-      Serial.printf("POST request failed, error: %s\n", http.errorToString(httpCode).c_str());
-      return false;
-    }
-    
-    // got a response
-    JsonDocument doc;
-    DeserializationError error = deserializeJson(doc, http.getStream());
-    if (error) {
-      Serial.print(F("deserializeJson() failed: "));
-      Serial.println(error.f_str());
-    } else {
-      const char* token = doc["data"][0]["accessToken"];
-      Serial.print("got token: ");
-      Serial.println(token);
-      strcpy(accessToken, token);
-      return true;
-    }
+  if (!http.begin(client, BASE_URI + "/server/login")) {
+    writeErrorToDisplay(F("failed to open http client"));
+    return false;
   }
+
+  http.useHTTP10(true); // https://arduinojson.org/v7/how-to/use-arduinojson-with-httpclient/
+  char output[256];
+  {
+    JsonDocument doc;
+    doc["terminalId"] = TERMINAL_ID;
+    doc["password"] = TERMINAL_PASSWORD;
+    doc["active"] = 0;
+    serializeJson(doc, output);
+  }
+  
+  http.addHeader("Content-Type", "application/json");
+  http.POST(output);
+  
+  JsonDocument doc;
+  auto data = handleResponse(http, doc);
+  http.end();
+  
+  if (data) {
+    const char* token = (*data)[0]["accessToken"];
+    Serial.print(F("got token: ")); Serial.println(token);
+    strcpy(accessToken, token);
+    return true;
+  }
+  
+  return false;
 }
 
 bool getPumpStatus() {
@@ -132,91 +188,60 @@ bool getPumpStatus() {
     if (!updateAccessToken()) return false;
   }
 
-  auto start = millis();
   WiFiClient client;
   HTTPClient http;
-  http.addHeader("Authorization", String(F("Bearer ")) + accessToken);
-  if (http.begin(client, BASE_URI + "/pumps")) {
-    http.useHTTP10(true); // https://arduinojson.org/v7/how-to/use-arduinojson-with-httpclient/
-    int httpCode = http.GET();
-    if (httpCode == 0) {
-      Serial.printf("GET request failed, error: %s\n", http.errorToString(httpCode).c_str());
-    } else {
-      // got a response
-      JsonDocument doc;
-      DeserializationError error = deserializeJson(doc, http.getStream());
-      if (error) {
-        Serial.print(F("deserializeJson() failed: "));
-        Serial.println(error.f_str());
-        return false;
-      } else {
-        display.clearDisplay();
-        JsonArray pumps = doc["data"];
-        int i = 0;
-        for (JsonVariant pump : pumps) {
-          int number = pump["number"];
-          const char* status = pump["status"];
-
-          Serial.print(F("number: ")); Serial.println(number);
-          Serial.print(F("status: ")); Serial.println(status);
-
-          display.setCursor(0, 8 * i++);
-          display.printf("Pump %02d: %s", number, status);
-        }
-        lastRequestMs = millis() - start;
-        drawStatusBar();
-        display.display();
-      }
-    }
+  if (!http.begin(client, BASE_URI + "/pumps")) {
+    writeErrorToDisplay(F("failed to open http client"));
+    return false;
   }
+
+  http.addHeader("Authorization", String(F("Bearer ")) + accessToken);
+  http.useHTTP10(true); // https://arduinojson.org/v7/how-to/use-arduinojson-with-httpclient/
+  http.GET();
+  
+  JsonDocument doc;
+  auto pumps = handleResponse(http, doc);
+  http.end();
+  if (!pumps) {
+    return false;
+  }
+
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  int i = 0;
+  for (JsonVariant pump : *pumps) {
+    if (i++ > 6) break;
+    
+    const char* name = pump["name"];
+    int state = pump["state"];
+
+    display.printf("%s: %s\n", name, PUMP_STATES[state]);
+  }
+
+  if (i == 0) {
+    display.print(F("~~~ no pumps ~~~"));
+  }
+
+  return true;
 }
 
-int todoToGet = 1;
 void loop() {
+  lastRequestMs = -1;
   auto start = millis();
 
-  digitalWrite(LED_BUILTIN, WiFi.status() == WL_CONNECTED);
-  if (WiFi.status() == WL_CONNECTED) {
-    WiFiClient client;
-    HTTPClient http;
-
-    if (http.begin(client, String(F("http://jsonplaceholder.typicode.com/todos/")) + todoToGet++)) {
-      http.useHTTP10(true); // https://arduinojson.org/v7/how-to/use-arduinojson-with-httpclient/
-      int httpCode = http.GET();
-      display.clearDisplay();
-
-      if (httpCode == 0) {
-        Serial.printf("GET request failed, error: %s\n", http.errorToString(httpCode).c_str());
-      } else {
-        // got a response
-        JsonDocument doc;
-        DeserializationError error = deserializeJson(doc, http.getStream());
-        if (error) {
-          Serial.print(F("deserializeJson() failed: "));
-          Serial.println(error.f_str());
-        } else {
-          int id = doc["id"];
-          int userId = doc["userId"];
-          const char* title = doc["title"];
-
-          // Serial.printf("user: %d, title: %s\n", userId, title);
-
-          display.setCursor(0, 0);
-          display.println(title);
-          display.println();
-          display.print(F("ID: "));
-          display.println(id);
-          display.print(F("UserID: "));
-          display.println(userId);
-        }
-      }
-      http.end();
-    }
+  if (WiFi.status() != WL_CONNECTED) {
+    writeErrorToDisplay("WIFI not connected");
+    delay(100);
+    return;
   }
 
-  lastRequestMs = (int)(millis() - start);  
-  drawStatusBar();
-  display.display();
-
-  delay(500);
+  if (getPumpStatus()) {
+    lastRequestMs = (int)(millis() - start);  
+    drawStatusBar();
+    display.display();
+    delay(100);
+  } else {
+    // error message logged to screen, wait for a bit
+    delay(10'000);
+  }
 }
